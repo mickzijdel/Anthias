@@ -178,7 +178,15 @@ markers = [
 #                            - full-page PNG into the same per-test dir.
 #   --output test-artifacts  - directory the GH Actions upload-artifact
 #                              step picks up (.gitignored).
-addopts = "--strict-markers --browser chromium --tracing retain-on-failure --screenshot only-on-failure --output test-artifacts"
+#   -m "not integration"     - integration and unit tests cannot share
+#                              a run: the Playwright tests leave state
+#                              that fails 92 unit tests which pass on
+#                              their own. The docs already say to run
+#                              them separately, so this makes the
+#                              default do it. CI is unaffected, because
+#                              a `-m` on the command line overrides this
+#                              one, and both CI jobs pass their own.
+addopts = "--strict-markers -m \"not integration\" --browser chromium --tracing retain-on-failure --screenshot only-on-failure --output test-artifacts"
 
 [tool.coverage.run]
 branch = true
