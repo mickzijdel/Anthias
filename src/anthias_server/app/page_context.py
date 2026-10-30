@@ -23,7 +23,10 @@ from anthias_common import (
     storage_health,
     undervoltage,
 )
-from anthias_common.board import LOW_RAM_THRESHOLD_KB
+from anthias_common.board import (
+    LOW_RAM_THRESHOLD_KB,
+    resolve_device_key,
+)
 from anthias_common.utils import (
     clamp_screen_rotation,
     connect_to_redis,
@@ -599,6 +602,7 @@ def device_settings() -> dict[str, Any]:
         'debug_logging': settings['debug_logging'],
         'prefer_dark_mode': settings['prefer_dark_mode'],
         'verify_ssl': settings['verify_ssl'],
+        'allow_unplayable_video': settings['allow_unplayable_video'],
         # Clamp on the read side so a stale conf value (e.g. an
         # old 45 from a hand-edit) doesn't leave the dropdown with no
         # ``selected`` option — the template's {% if screen_rotation
@@ -674,6 +678,19 @@ def assets() -> dict[str, Any]:
         # same constant the v2 serializer / form handler use, so the
         # client-side and server-side caps can't drift.
         'refresh_interval_s_max': REFRESH_INTERVAL_S_MAX,
+        # Resolved once here and handed to the playback filters,
+        # rather than per row. On the catch-all ``arm64`` image this
+        # reaches the host_agent's published subtype over Redis, and
+        # the table renders every row through ``to_json`` several
+        # times and re-renders the lot on a 5 s poll: measured on
+        # ``arm64``, a 40-row render went from roughly 11 ms to a
+        # quarter of a second when each row resolved it for itself.
+        #
+        # One snapshot per render is also the correctness property
+        # ``processing`` threads the same key for: two lookups during
+        # one render could disagree while the host_agent is mid
+        # publish, and the table would contradict itself row to row.
+        'board_key': resolve_device_key(),
     }
 
 

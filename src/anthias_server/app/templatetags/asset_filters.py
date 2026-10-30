@@ -19,6 +19,7 @@ from django.template import Library
 from django.utils import timezone
 from django.utils.safestring import SafeString, mark_safe
 
+from anthias_server.lib import playback_envelope
 from anthias_server.settings import settings
 
 register = Library()
@@ -112,7 +113,7 @@ def asset_date(value: datetime | None) -> str:
     return local.strftime(f'{date_part} {time_part}')
 
 
-def _to_dict(obj: Any) -> Any:
+def _to_dict(obj: Any, board_key: str = '') -> Any:
     if hasattr(obj, '_meta'):
         out: dict[str, Any] = {}
         for field in obj._meta.fields:
@@ -167,6 +168,16 @@ def _to_dict(obj: Any) -> Any:
             meta = dict(meta)
             meta['headers'] = normalize_asset_headers(meta['headers'])
             out['metadata'] = meta
+        # Decode-envelope findings, computed server-side so the modal
+        # never has to reimplement the per-board rules in JS. Always
+        # present (possibly empty) so the Alpine template can bind to
+        # it without an existence guard on every row.
+        meta = out.get('metadata')
+        out['playback_warnings'] = (
+            [w.as_dict() for w in playback_envelope.evaluate(meta, board_key)]
+            if isinstance(meta, dict)
+            else []
+        )
         return out
     return _coerce(obj)
 
@@ -178,10 +189,19 @@ def _coerce(value: Any) -> Any:
 
 
 @register.filter
-def to_json(value: Any) -> SafeString:
-    """Render an Asset (or any model) as a JSON literal for Alpine."""
+def to_json(value: Any, board_key: str = '') -> SafeString:
+    """Render an Asset (or any model) as a JSON literal for Alpine.
+
+    ``board_key`` is the board the page was rendered for, resolved
+    once in ``page_context.assets()``. It is taken as an argument
+    rather than looked up here because this runs several times per
+    row on a 5 s poll, and because two lookups inside one render
+    could disagree while the host_agent is mid publish. Defaults to
+    the empty string, which matches no rule, so a caller that has no
+    board gets no playback findings rather than wrong ones.
+    """
     encoded = json.dumps(
-        _to_dict(value),
+        _to_dict(value, board_key),
         default=str,
         separators=(',', ':'),
     )
@@ -378,3 +398,36 @@ def humanize_duration(value: Any) -> str:
             parts.append(f'{seconds}s')
         return ' '.join(parts)
     return f'{seconds}s'
+
+
+@register.filter
+def playback_warnings(asset: Any, board_key: str = '') -> list[dict[str, str]]:
+    """Return decode-envelope warnings for ``asset``, most severe
+    first.
+
+    A *blocking* warning here usually means an asset that predates
+    the upload gate, or one the gate has just refused — but it can
+    also mean a card moved between boards, or a subtype that resolved
+    after the upload. The list is not closed, which is why nothing
+    branches on the reason. The
+    rejected row survives — the gate writes its probe metadata before
+    it raises — so both are reachable, and the row template suppresses
+    the chip when ``metadata.error_message`` is set so the operator
+    does not read the same sentence twice under two headings.
+
+    ``board_key`` is resolved once per render in
+    ``page_context.assets()`` and passed in; see ``to_json``.
+
+    Returns an empty list for images, web pages, assets whose
+    metadata we could not measure, and boards whose decode path is
+    not characterised well enough to judge. Empty means "nothing we
+    can prove is wrong", which is not a promise that playback is
+    fine, so the template must not render it as one.
+    """
+    metadata = _to_dict(getattr(asset, 'metadata', None))
+    if not isinstance(metadata, dict):
+        return []
+    return [
+        warning.as_dict()
+        for warning in playback_envelope.evaluate(metadata, board_key)
+    ]

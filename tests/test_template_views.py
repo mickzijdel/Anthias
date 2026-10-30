@@ -10,6 +10,7 @@ accumulate coverage. These tests do.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import time, timedelta
@@ -265,7 +266,7 @@ def test_page_context_integrations_when_off_balena() -> None:
 
 @pytest.mark.django_db
 def test_to_json_serialises_asset(asset: Asset) -> None:
-    encoded = str(to_json(asset))
+    encoded = str(to_json(asset, 'pi4-64'))
     assert asset.asset_id in encoded
     assert (asset.name or '') in encoded
     # The inline blob is later read inside an HTML attribute; the filter
@@ -273,7 +274,7 @@ def test_to_json_serialises_asset(asset: Asset) -> None:
     # well-formed even when an asset name contains either character.
     asset.name = "Foo & Bar's video"
     asset.save()
-    encoded = str(to_json(asset))
+    encoded = str(to_json(asset, 'pi4-64'))
     assert '&' not in encoded.replace('\\u0026', '')
     assert "'" not in encoded.replace('\\u0027', '')
 
@@ -5121,6 +5122,237 @@ def test_system_info_storage_card_exposes_the_evidence(
 
 
 # ---------------------------------------------------------------------------
+# Decode-envelope warnings surfaced on the asset list
+
+
+@pytest.mark.django_db
+def test_playback_warnings_flags_existing_oversized_asset(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4K H.264 row that predates the upload gate keeps playing but
+    must carry a blocking warning the operator can act on."""
+    from anthias_server.app.templatetags.asset_filters import (
+        playback_warnings,
+    )
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    asset.mimetype = 'video'
+    asset.metadata = {
+        'video_codec': 'h264',
+        'video_width': 3840,
+        'video_height': 2160,
+    }
+    asset.save()
+
+    warnings = playback_warnings(asset, 'pi4-64')
+    assert [w['code'] for w in warnings] == ['h264_frame_too_large']
+    assert warnings[0]['severity'] == 'blocking'
+    assert warnings[0]['remedy']
+
+
+@pytest.mark.django_db
+def test_playback_warnings_silent_for_ordinary_assets(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Images, web pages and in-envelope video must produce nothing —
+    a badge on a working asset teaches operators to ignore badges."""
+    from anthias_server.app.templatetags.asset_filters import (
+        playback_warnings,
+    )
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    for metadata in (
+        {},
+        {'video_codec': 'h264', 'video_width': 1920, 'video_height': 1080},
+        {'video_codec': 'h264', 'video_width': 1080, 'video_height': 1920},
+        {'video_codec': 'h264'},
+        {'video_codec': 'hevc', 'video_width': 3840, 'video_height': 2160},
+    ):
+        asset.metadata = metadata
+        asset.save()
+        assert playback_warnings(asset, 'pi4-64') == [], (
+            f'{metadata} should be silent'
+        )
+
+    # An object with no metadata attribute at all (defensive: the
+    # filter runs against whatever the template hands it).
+    assert playback_warnings(object(), 'pi4-64') == []
+
+
+@pytest.mark.django_db
+def test_to_json_carries_playback_warnings_for_the_modal(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit modal binds to editAsset.playback_warnings, so the key
+    must always be present — computed server-side rather than
+    reimplementing the per-board rules in Alpine."""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    asset.mimetype = 'video'
+    asset.metadata = {
+        'video_codec': 'h264',
+        'video_width': 3840,
+        'video_height': 2160,
+    }
+    asset.save()
+    payload = json.loads(str(to_json(asset, 'pi4-64')).replace('\\u0027', "'"))
+    assert payload['playback_warnings'][0]['code'] == 'h264_frame_too_large'
+
+    asset.metadata = {}
+    asset.save()
+    payload = json.loads(str(to_json(asset, 'pi4-64')).replace('\\u0027', "'"))
+    assert payload['playback_warnings'] == []
+
+
+# ---------------------------------------------------------------------------
+# The rendered asset row — the filters were tested, the markup was not
+
+
+@pytest.mark.django_db
+def test_rejected_upload_shows_one_warning_not_two(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused upload must not wear both pills.
+
+    The gate writes its probe metadata *before* it raises and
+    ``on_failure`` adds ``error_message`` to that same row, so a
+    rejected 4K upload is simultaneously "has envelope warnings" and
+    "has an error". Three comments in this codebase used to assert
+    that combination was unreachable; it is in fact the single most
+    common path — upload a 4K file to a Pi 4 — and it rendered two
+    amber pills that said the same thing, one of them claiming the
+    asset was still playing when it never got in.
+    """
+    from django.template.loader import render_to_string
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    asset.mimetype = 'video'
+    asset.metadata = {
+        'video_codec': 'h264',
+        'video_width': 3840,
+        'video_height': 2160,
+        'error_message': 'Video is 3840x2160, past the 1920 bound.',
+        'error_recipe': 'ffmpeg -i in.mp4 ...',
+    }
+    asset.save()
+
+    html = render_to_string(
+        '_asset_row.html',
+        {'asset': asset, 'is_active': True, 'board_key': 'pi4-64'},
+    )
+    assert 'error-pill' in html, 'the failure pill carries the recipe'
+    assert 'playback-chip' not in html, 'and must not be doubled up'
+
+
+@pytest.mark.django_db
+def test_in_rotation_asset_shows_the_chip(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the chip exists for: a row that predates the gate, so
+    it is still playing and carries no error."""
+    from django.template.loader import render_to_string
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    asset.mimetype = 'video'
+    asset.metadata = {
+        'video_codec': 'h264',
+        'video_width': 3840,
+        'video_height': 2160,
+    }
+    asset.save()
+
+    html = render_to_string(
+        '_asset_row.html',
+        {'asset': asset, 'is_active': True, 'board_key': 'pi4-64'},
+    )
+    assert 'playback-chip playback-chip--blocking' in html
+    assert 'Will not play well' in html
+    assert 'error-pill' not in html
+
+
+@pytest.mark.django_db
+def test_ordinary_video_row_renders_no_warning_markup(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-envelope clip must render a clean row."""
+    from django.template.loader import render_to_string
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    asset.mimetype = 'video'
+    asset.metadata = {
+        'video_codec': 'h264',
+        'video_width': 1920,
+        'video_height': 1080,
+    }
+    asset.save()
+
+    html = render_to_string(
+        '_asset_row.html',
+        {'asset': asset, 'is_active': True, 'board_key': 'pi4-64'},
+    )
+    assert 'playback-chip' not in html
+    assert 'error-pill' not in html
+
+
+@pytest.mark.django_db
+def test_modal_keeps_the_two_banners_mutually_exclusive(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Structural guard on the modal's Alpine condition.
+
+    The row's version of this guard is Django and is tested by
+    behaviour. The modal's is an Alpine ``x-if``, which no Django
+    render can evaluate — so this asserts the negation is *present*
+    rather than that it works. That catches the realistic regression
+    (someone simplifies the condition and the double banner returns,
+    which already shipped once) but not a logic error inside it.
+    Full coverage needs a Playwright case; noted rather than faked.
+    """
+    from django.template.loader import render_to_string
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    html = render_to_string('_asset_modal.html', {'asset': asset})
+    assert 'editAsset.playback_warnings.length' in html
+    assert '!(editAsset.metadata && editAsset.metadata.error_message)' in html
+    # And the failure banner is the exact complement.
+    assert (
+        'x-show="editAsset.metadata && editAsset.metadata.error_message"'
+        in html
+    )
+
+
+@pytest.mark.django_db
+def test_overridden_asset_tells_the_operator_to_watch_the_screen(
+    asset: Asset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An asset let through by the escape hatch reads differently.
+
+    "Will not play well" is the right words when we refused the
+    upload. Once the operator has overridden that, the useful
+    instruction is to go and look — which is the one thing nobody was
+    doing when this gate was built.
+    """
+    from django.template.loader import render_to_string
+
+    monkeypatch.setenv('DEVICE_TYPE', 'pi4-64')
+    asset.mimetype = 'video'
+    asset.metadata = {
+        'video_codec': 'h264',
+        'video_width': 3840,
+        'video_height': 2160,
+        'playback_override': True,
+    }
+    asset.save()
+
+    html = render_to_string(
+        '_asset_row.html',
+        {'asset': asset, 'is_active': True, 'board_key': 'pi4-64'},
+    )
+    assert 'Check the screen' in html
+    assert 'Will not play well' not in html
+    # The finding itself is unchanged — only who decided about it.
+    assert 'playback-chip--blocking' in html
+
+
 # Auth changes reap open /ws sockets (Copilot reviews on PRs 3324/3336).
 #
 # AssetConsumer decides authorization at handshake time, so a socket

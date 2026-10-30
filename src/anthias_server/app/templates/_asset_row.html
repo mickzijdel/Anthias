@@ -32,6 +32,32 @@
           {% endfor %}
         </span>
         {% endif %}
+        {% with warnings=asset|playback_warnings:board_key %}
+        {% if warnings and not asset.metadata.error_message %}
+        {% comment %} Decode-envelope findings for an asset that is
+           on disk and in rotation, which means a row that predates
+           the upload gate. It keeps its toggle and keeps playing, and
+           the operator gets told why the screen looks wrong instead
+           of being left to guess.
+
+           Suppressed when the row carries metadata.error_message. A
+           rejected upload keeps its row — the gate writes the probe
+           metadata before it raises, and on_failure adds the error to
+           the same row — so without this guard the operator gets two
+           amber pills saying the same thing, one of which claims the
+           asset is playing when it never got in. The Failed pill wins
+           there: it already carries the message, the ffmpeg recipe
+           and the HandBrake steps. {% endcomment %}
+        <button type="button"
+              class="playback-chip playback-chip--{{ warnings.0.severity }}"
+              title="{{ warnings.0.message }}"
+              aria-label="Playback warning: {{ warnings.0.message }} Click to view details."
+              @click='openEdit({{ asset|to_json:board_key }})'>
+          <i class="ti ti-alert-triangle" aria-hidden="true"></i>
+          <span>{% if asset.metadata.playback_override %}Check the screen{% else %}Will not play well{% endif %}</span>
+        </button>
+        {% endif %}
+        {% endwith %}
       </span>
     </div>
   </td>
@@ -62,7 +88,7 @@
           class="error-pill"
           title="{{ asset.metadata.error_message }}"
           aria-label="Processing failed: {{ asset.metadata.error_message }} — click to view details"
-          @click='openEdit({{ asset|to_json }})'>
+          @click='openEdit({{ asset|to_json:board_key }})'>
       <i class="ti ti-alert-triangle"></i>Failed
     </button>
     {% else %}
@@ -86,7 +112,7 @@
         type="button"
         class="app-btn app-btn-icon"
         title="Preview"
-        @click='openPreview({{ asset|to_json }})'
+        @click='openPreview({{ asset|to_json:board_key }})'
       ><i class="ti ti-eye"></i></button>
       <a
         href="{% url 'anthias_app:assets_download' asset_id=asset.asset_id %}"
@@ -97,7 +123,7 @@
         type="button"
         class="app-btn app-btn-icon"
         title="Edit"
-        @click='openEdit({{ asset|to_json }})'
+        @click='openEdit({{ asset|to_json:board_key }})'
       ><i class="ti ti-pencil"></i></button>
       <button
         type="button"
