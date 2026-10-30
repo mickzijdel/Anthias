@@ -101,9 +101,12 @@ def viewer_fixtures(
     # succeed and those asserts would go quiet. ENOSYS specifically --
     # ProcessLookupError means "already gone", which sends nothing at
     # all. The dedicated pidfd tests patch this themselves.
+    # ``raising=False``: the attribute is absent entirely on a CPython
+    # build without the pidfd API, which is what uv installs.
     monkeypatch.setattr(
         'anthias_viewer.os.pidfd_open',
         mock.Mock(side_effect=OSError(errno.ENOSYS, 'not implemented')),
+        raising=False,
     )
     fixtures = _ViewerFixtures()
     original_splash_delay = viewer.SPLASH_DELAY
@@ -754,7 +757,9 @@ def test_reclaim_signals_through_a_pidfd_when_the_kernel_has_one(
         mock.patch.object(
             viewer, '_webview_name_owner_pid', lambda: next(owners, None)
         ),
-        mock.patch('anthias_viewer.os.pidfd_open', return_value=77) as m_open,
+        mock.patch(
+            'anthias_viewer.os.pidfd_open', return_value=77, create=True
+        ) as m_open,
         mock.patch('anthias_viewer.os.close') as m_close,
         mock.patch(
             'anthias_viewer.pidfd_send_signal',
@@ -782,7 +787,9 @@ def test_reclaim_closes_the_pidfd_even_when_the_name_survives(
     descriptors over a long restart loop."""
     with (
         mock.patch.object(viewer, '_webview_name_owner_pid', lambda: 4242),
-        mock.patch('anthias_viewer.os.pidfd_open', return_value=77),
+        mock.patch(
+            'anthias_viewer.os.pidfd_open', return_value=77, create=True
+        ),
         mock.patch('anthias_viewer.os.close') as m_close,
         mock.patch('anthias_viewer.pidfd_send_signal'),
         mock.patch.object(viewer, 'sleep'),
@@ -815,6 +822,7 @@ def test_reclaim_sends_nothing_when_the_owner_is_already_gone(
         mock.patch(
             'anthias_viewer.os.pidfd_open',
             side_effect=ProcessLookupError('no such process'),
+            create=True,
         ),
         mock.patch('anthias_viewer.os.kill') as m_kill,
         mock.patch('anthias_viewer.pidfd_send_signal') as m_send,
@@ -842,7 +850,9 @@ def test_reclaim_does_not_signal_a_pid_that_changed_hands(
             '_webview_name_owner_pid',
             mock.Mock(side_effect=[4242, 9999]),
         ),
-        mock.patch('anthias_viewer.os.pidfd_open', return_value=77),
+        mock.patch(
+            'anthias_viewer.os.pidfd_open', return_value=77, create=True
+        ),
         mock.patch('anthias_viewer.os.close'),
         mock.patch('anthias_viewer.os.kill') as m_kill,
         mock.patch('anthias_viewer.pidfd_send_signal') as m_send,
@@ -870,6 +880,7 @@ def test_reclaim_declines_to_signal_when_the_pid_cannot_be_pinned(
         mock.patch(
             'anthias_viewer.os.pidfd_open',
             side_effect=OSError(errno.EMFILE, 'too many open files'),
+            create=True,
         ),
         mock.patch('anthias_viewer.os.kill') as m_kill,
         mock.patch('anthias_viewer.pidfd_send_signal') as m_send,
@@ -899,6 +910,7 @@ def test_reclaim_uses_the_numeric_pid_when_the_kernel_lacks_pidfd(
         mock.patch(
             'anthias_viewer.os.pidfd_open',
             side_effect=OSError(errno.ENOSYS, 'not implemented'),
+            create=True,
         ),
         mock.patch(
             'anthias_viewer.os.kill',
@@ -5142,3 +5154,38 @@ def test_wait_for_server_logs_when_it_gives_up(
         finally:
             logging.disable(logging.CRITICAL)
     assert any('did not answer' in r.getMessage() for r in caplog.records)
+
+
+class TestSignalTargetWithoutPidfd:
+    """The pidfd API is conditional on the CPython build, not only the
+    kernel: the python-build-standalone interpreters uv installs ship
+    with neither ``os.pidfd_open`` nor ``signal.pidfd_send_signal``.
+    """
+
+    def test_module_imports_without_the_sender(self) -> None:
+        """Importing the name directly made this module unimportable on
+        such a build, which took seven test files down with it. The
+        attribute must exist either way, as the symbol or as None."""
+        assert hasattr(viewer, 'pidfd_send_signal')
+
+    def test_a_build_with_no_sender_signals_by_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pidfd is useless without the call that sends through it, so
+        a build exposing ``os.pidfd_open`` alone has to take the numeric
+        path rather than raise."""
+        monkeypatch.setattr(viewer, 'pidfd_send_signal', None)
+        monkeypatch.setattr(os, 'pidfd_open', lambda pid: 4242, raising=False)
+        closed: list[int] = []
+        monkeypatch.setattr(os, 'close', closed.append)
+        sent: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            os, 'kill', lambda pid, sig: sent.append((pid, sig))
+        )
+
+        with viewer._signal_target(1234) as send:
+            send(SIGTERM)
+
+        assert sent == [(1234, SIGTERM)]
+        # The fd was opened, so it still has to be closed.
+        assert closed == [4242]

@@ -16,12 +16,24 @@ from signal import (
     SIGKILL,
     SIGTERM,
     Signals,
-    pidfd_send_signal,
     signal,
 )
 from threading import Lock
 from time import monotonic, sleep, time
 from typing import Any
+
+# ``signal.pidfd_send_signal`` and ``os.pidfd_open`` are each
+# conditional on the CPython build, not just the kernel: the
+# python-build-standalone interpreters uv installs ship without
+# either. Importing the name directly made this module unimportable
+# there, which took seven test files down on any uv-managed Python.
+# ``_signal_target`` already falls back to a numeric pid when the
+# pidfd API is missing, so the fallback only needed a chance to run.
+pidfd_send_signal: Callable[..., None] | None
+try:
+    from signal import pidfd_send_signal as pidfd_send_signal
+except ImportError:
+    pidfd_send_signal = None
 from urllib.parse import urlparse, urlunparse
 
 import django
@@ -1124,7 +1136,7 @@ def _signal_target(pid: int) -> Iterator[Callable[[int], None]]:
     try:
         fd = os.pidfd_open(pid)
     except AttributeError:
-        # Python without the pidfd API at all.
+        # Build without ``os.pidfd_open``; see the guarded import above.
         logger.debug('No pidfd API; using the numeric pid', exc_info=True)
     except ProcessLookupError:
         logger.debug('pid %d is already gone', pid, exc_info=True)
@@ -1143,7 +1155,7 @@ def _signal_target(pid: int) -> Iterator[Callable[[int], None]]:
     try:
         if send_nothing:
             yield lambda _sig: None
-        elif fd is None:
+        elif fd is None or pidfd_send_signal is None:
             yield lambda sig: os.kill(pid, sig)
         else:
             yield lambda sig: pidfd_send_signal(fd, sig)
