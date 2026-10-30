@@ -77,6 +77,8 @@ from anthias_common.board import (
     resolve_device_key,
 )
 from anthias_server.app.models import Asset
+from anthias_server.lib import playback_envelope
+from anthias_server.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -1240,6 +1242,32 @@ def _ffprobe_summary(input_path: str) -> dict[str, Any]:
         envelope transcode to decide whether to emit
         ``-r envelope.max_fps`` (only when source > cap; the cap
         is one-way and never up-converts sub-cap content).
+      * ``video_pix_fmt`` — the first video stream's pixel format
+        (``'yuv420p'``, ``'yuv420p10le'``, …), or ``None``. The
+        decode envelope blocks on this: the VideoCore capture queue
+        is 8-bit 4:2:0 only, so a High 10 or 4:2:2 source falls to
+        software decode.
+      * ``video_bit_rate`` — bits per second as an int, taken from
+        the video stream and falling back to the container's overall
+        rate when the stream doesn't carry one (Matroska frequently
+        doesn't). ``None`` when neither is available.
+
+        Diagnostics only — nothing branches on it. Note the fallback
+        makes the name slightly generous: a container figure includes
+        audio. That is immaterial while it is only ever read by a
+        human triaging a report, but anyone reintroducing a bitrate
+        rule needs to know the number is not always the video
+        stream's. (A rule was tried and removed: measured on a Pi 4B,
+        1080p H.264 still hardware-decodes at 2.5x realtime at
+        137 Mbps, so any threshold worth setting flagged files that
+        play fine.)
+      * ``video_level`` / ``video_profile`` — the declared H.264 /
+        HEVC level (``51`` for level 5.1) and profile (``'High'``).
+        Recorded for diagnostics **only**. Nothing branches on the
+        level: the V4L2 driver exposes it read-only and never
+        validates the bitstream against it, so an inflated level tag
+        on an otherwise-fine 1080p file is common and harmless. See
+        ``lib/playback_envelope.py``.
       * ``audio_codec`` — lowercase codec name, ``'none'`` when the
         file genuinely carries no audio stream, or ``'unknown'`` if
         the audio stream existed but ffprobe couldn't name its
@@ -1270,6 +1298,11 @@ def _ffprobe_summary(input_path: str) -> dict[str, Any]:
             'video_width': None,
             'video_height': None,
             'video_fps': None,
+            'video_pix_fmt': None,
+            'video_rotation': None,
+            'video_bit_rate': None,
+            'video_level': None,
+            'video_profile': None,
             'audio_codec': 'unknown',
             'duration_seconds': None,
         }
@@ -1308,7 +1341,7 @@ def _ffprobe_summary(input_path: str) -> dict[str, Any]:
     try:
         vw = int((video or {}).get('width') or 0)
         vh = int((video or {}).get('height') or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         vw = vh = 0
     video_width: int | None = vw if vw > 0 else None
     video_height: int | None = vh if vh > 0 else None
@@ -1329,6 +1362,65 @@ def _ffprobe_summary(input_path: str) -> dict[str, Any]:
                 video_fps = num / den
         except ValueError:
             video_fps = None
+    # Pixel format drives the envelope's 8-bit-4:2:0 check. ffprobe
+    # omits it for streams it couldn't fully parse, which reads as
+    # "not measured" and suppresses that check rather than failing it.
+    raw_pix_fmt = (video or {}).get('pix_fmt')
+    video_pix_fmt: str | None = None
+    if isinstance(raw_pix_fmt, str) and raw_pix_fmt.strip():
+        video_pix_fmt = raw_pix_fmt.strip().lower()
+    # Bitrate: the video stream's own figure where present, else the
+    # container's. Matroska and some MP4 muxers leave the per-stream
+    # value out entirely, and a container-level figure is better than
+    # nothing when somebody is triaging a report. Nothing branches on
+    # it — a bitrate rule was tried and measurement killed it.
+    video_bit_rate: int | None = None
+    for candidate in (
+        (video or {}).get('bit_rate'),
+        fmt_data.get('bit_rate'),
+    ):
+        if candidate is None:
+            continue
+        try:
+            parsed = int(float(candidate))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if parsed > 0:
+            video_bit_rate = parsed
+            break
+    # Declared level (ffprobe reports 5.1 as the integer 51) and
+    # profile. Diagnostics only — see the docstring. ffprobe writes
+    # -99 (and other negatives) when the container carries no level
+    # at all, so anything non-positive reads as absent.
+    video_level: int | None = None
+    raw_level = (video or {}).get('level')
+    if raw_level is not None:
+        try:
+            parsed_level = int(raw_level)
+        except (TypeError, ValueError, OverflowError):
+            parsed_level = 0
+        if parsed_level > 0:
+            video_level = parsed_level
+    # Rotation lives in the stream's display matrix, not in its
+    # dimensions. ffmpeg applies that matrix *before* any user filter,
+    # so a phone-shot vertical clip arrives coded 3840x2160 and is
+    # 2160x3840 by the time our scale clause sees it — which is how a
+    # portrait master ended up squeezed into a landscape box.
+    video_rotation: int | None = None
+    for entry in (video or {}).get('side_data_list') or []:
+        if not isinstance(entry, dict) or 'rotation' not in entry:
+            continue
+        try:
+            video_rotation = int(float(entry['rotation'])) % 360
+        except (TypeError, ValueError, OverflowError):
+            video_rotation = None
+        break
+    raw_profile = (video or {}).get('profile')
+    video_profile: str | None = (
+        raw_profile.strip()
+        if isinstance(raw_profile, str) and raw_profile.strip()
+        else None
+    )
     if audio is None:
         audio_codec = 'none'
     else:
@@ -1346,7 +1438,7 @@ def _ffprobe_summary(input_path: str) -> dict[str, Any]:
     else:
         try:
             duration_seconds = max(1, int(float(raw_duration)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             duration_seconds = None
     return {
         'container': container,
@@ -1355,6 +1447,11 @@ def _ffprobe_summary(input_path: str) -> dict[str, Any]:
         'video_width': video_width,
         'video_height': video_height,
         'video_fps': video_fps,
+        'video_pix_fmt': video_pix_fmt,
+        'video_rotation': video_rotation,
+        'video_bit_rate': video_bit_rate,
+        'video_level': video_level,
+        'video_profile': video_profile,
         'audio_codec': audio_codec,
         'duration_seconds': duration_seconds,
     }
@@ -1366,6 +1463,11 @@ _VIDEO_METADATA_KEYS = (
     'video_width',
     'video_height',
     'video_fps',
+    'video_pix_fmt',
+    'video_rotation',
+    'video_bit_rate',
+    'video_level',
+    'video_profile',
     'audio_codec',
 )
 
@@ -1389,9 +1491,10 @@ _VIDEO_METADATA_KEYS = (
 # — a 2 GB+ board with no measured ceiling — takes its accepted codecs
 # at any resolution.
 #
-# THREE ENTRIES BELOW ARE KNOWN NOT TO PLAY CLEANLY, and they are
+# TWO ENTRIES BELOW ARE KNOWN NOT TO PLAY CLEANLY, and they are
 # listed as open defects, not as measurement gaps — the measurements
-# exist and say these fail:
+# exist and say these fail. A third, ``pi4-64``'s unbounded h264, is
+# recorded here as closed:
 #
 #   * ``x86`` accepts ``hevc``, but HEVC through VAAPI black-screens on
 #     x86 — QMediaPlayer emits FormatError and decodes 0 frames. That
@@ -1403,16 +1506,20 @@ _VIDEO_METADATA_KEYS = (
 #     tier we recommend, and the failure is silent.
 #   * ``rockpi4`` accepts ``hevc``, measured dropping ~22 % of frames
 #     at 1080p30 (docs/board-enablement.md).
-#   * ``pi4-64`` accepts ``h264`` with no ceiling, so 4K H.264 passes
-#     on a high-RAM Pi 4 although the Pi 4 decoder tops out at 1080p
-#     H.264 and anything above it falls back to software.
+#   * CLOSED: ``pi4-64`` accepted ``h264`` with no ceiling, so 4K
+#     H.264 passed on a high-RAM Pi 4 and fell back to software.
+#     ``lib/playback_envelope`` now refuses what the decoder refuses.
+#     Note the bound is not "1080p", which is what this comment used
+#     to say: the VideoCore decoder takes up to 1920 on each axis AND
+#     up to 8192 macroblocks a frame, so 1456x1440 plays and 1920x1200
+#     does not. See that module for the measurements.
 #
-# Each wants either the codec removed or a measured cap added. Both
-# are behaviour changes that would start rejecting uploads operators
-# make today, on boards in the field, so they are a product call and
-# a separate change — not something to slip into a docs pass. Until
-# then this comment is the honest statement of what the map is: an
-# allowlist carrying three entries we know are wrong.
+# Each remaining one wants either the codec removed or a measured cap
+# added. Both are behaviour changes that would start rejecting uploads
+# operators make today, on boards in the field, so they are a product
+# call and a separate change — not something to slip into a docs pass.
+# Until then this comment is the honest statement of what the map is:
+# an allowlist carrying two entries we know are wrong.
 #
 # NOT a hardware-decode certificate, despite the name — which is
 # historical, from when it was one. Some entries are deliberately
@@ -1438,9 +1545,11 @@ _HW_DECODE_VIDEO_CODECS: dict[str, frozenset[str]] = {
     'pi2': frozenset({'h264'}),
     'pi3': frozenset({'h264'}),
     # pi3-64: 64-bit Qt6 image on the same VideoCore IV silicon as pi3 —
-    # H.264-only HW decode (no HEVC). Decoded in-process by
-    # AnthiasViewer's QtMultimedia pipeline (ffmpeg/libavcodec backend →
-    # V4L2 bcm2835-codec), not the Qt5 GStreamer fbdev path.
+    # H.264-only HW decode (no HEVC). Decoded in-process by an
+    # AnthiasViewer GStreamer pipeline (v4l2h264dec → kmssink on a vc4
+    # DRM overlay plane), not the Qt5 GStreamer fbdev path and not
+    # QtMultimedia — VideoCore IV's GLES2 cannot render QtMultimedia's
+    # video node at all, which is what the overlay path works around.
     'pi3-64': frozenset({'h264'}),
     'pi4-64': frozenset({'h264', 'hevc'}),
     # hevc: hardware-decoded via v4l2-request (BCM2712 VideoCore VII).
@@ -1481,16 +1590,51 @@ _HW_DECODE_VIDEO_CODECS: dict[str, frozenset[str]] = {
 #
 # A board is listed only once someone has measured its ceiling on
 # hardware, so absence means "no measurement", NOT "hardware-decodes
-# everything it accepts". ``pi5`` is the standing example: it accepts
-# h264 knowing it decodes in software (see its entry above), and is
-# unlisted only because nobody has timed 4K H.264 on a Cortex-A76.
-# Adding a board here needs a number off a real device — an invented
-# ceiling would reject uploads that play fine.
-_SW_DECODE_MAX_PIXELS: dict[str, int] = {
+# everything it accepts". Adding a board here needs a number off a
+# real device — an invented ceiling would reject uploads that play
+# fine.
+# Keyed by board AND codec, because a board-level key cannot say
+# "software H.264 but hardware HEVC on the same silicon", which is
+# exactly what a Pi 5 is: its BCM2712 block decodes HEVC at 4Kp60
+# while H.264 runs on the A76 cores. Applying a board-wide ceiling
+# there would refuse a 4K HEVC upload the hardware plays perfectly.
+# ``rk3566`` never exposed the problem because it accepts only h264.
+_SW_DECODE_MAX_PIXELS: dict[str, dict[str, int]] = {
     # 2.56x real time at 1080p (see the rk3566 note above); 4K is ~4x
     # the pixel work, which lands under real time before the web UI
     # takes its share.
-    'rk3566': 1920 * 1080,
+    'rk3566': {'h264': 1920 * 1080},
+    # The largest frame measured to keep up, matching the rk3566
+    # idiom above. Decode-only fps on a Pi 5, real High-profile
+    # content, measured on the Screenly testbed at three levels of
+    # CPU contention:
+    #
+    #     frame                 idle    3 cores busy    1 thread
+    #     1920x1080   2.07 Mpx  162.2       68.7          56.3
+    #     2560x1440   3.69 Mpx   93.4       59.1          33.4
+    #     1920x1920   3.69 Mpx   77.6       59.2          34.5
+    #     3840x2160   8.29 Mpx   43.9       18.9          16.0
+    #
+    # The middle column is the honest one: a loaded viewer shares its
+    # cores with QtWebEngine and the scene graph. 1440p holds 59 fps
+    # there, 2.4x real time for 25 fps content; 4K manages 18.9.
+    #
+    # Worth being straight about the cost: the band between 3.7 and
+    # 8.3 Mpx was never measured, and the cap refuses all of it. A
+    # power law through the two contended figures puts the real 30 fps
+    # crossover nearer 6 Mpx, so a 3000x2000 upload is probably
+    # playable and is refused anyway. The alternative was a cap just
+    # below 4K, which would accept that band untested. Refusing it
+    # keeps the rule to what a real device actually produced, which is
+    # the same standard the rk3566 entry holds, and a reading at
+    # 3000x2000 is all it takes to raise this.
+    #
+    # Note the budget is in *pixels*, not per axis. An earlier draft
+    # bounded each axis at 1920 and was wrong in both directions at
+    # once: it flagged 2560x1440, which is fine, and stayed silent on
+    # 1920x1920, which has exactly the same pixel count. 2560x1440 and
+    # 1920x1920 both land on this cap and both pass it.
+    'pi5': {'h264': 2560 * 1440},
 }
 
 
@@ -1504,6 +1648,250 @@ _SW_DECODE_MAX_PIXELS: dict[str, int] = {
 # at upload — the operator gets the same "Failed" pill + recipe UX
 # the codec gate already uses.
 _LOW_RAM_MAX_PIXELS = 1920 * 1080
+
+# The low-RAM box. Kept next to the cap it comes from so a change to
+# one cannot leave the recipe quietly disagreeing with the message
+# printed beside it. It is an *area* budget, so a landscape box is
+# right even for portrait content — but only once it has been
+# turned to match the source, which is what ``_low_ram_box`` below is
+# for. Both orientations bound the same 2,073,600 pixels.
+_LOW_RAM_BOX = (1920, 1080)
+
+
+def _display_dimensions(
+    width: int | None, height: int | None, rotation: int | None
+) -> tuple[int | None, int | None]:
+    """The frame as the *viewer* will see it, not as it is coded.
+
+    A 90 or 270 degree display matrix swaps the axes, and ffmpeg
+    honours it before any filter we emit — so every decision about
+    which way round a frame is has to be made on these numbers. The
+    decoder's own bound is the exception: it acts on the coded frame,
+    so the blocking check deliberately keeps using the raw values.
+    """
+    if rotation is not None and abs(rotation) % 180 == 90:
+        return height, width
+    return width, height
+
+
+def _low_ram_box(width: int | None, height: int | None) -> tuple[int, int]:
+    """The low-RAM box, oriented to the source.
+
+    The cap is an *area* budget — 1920x1080 pixels — so a portrait
+    1080x1920 clip sits exactly on it and is perfectly acceptable.
+    Fitting a portrait source into the landscape box anyway produces
+    608x1080: under a third of a budget it was entitled to spend, and
+    the same "two thirds of the frame thrown away" fault that was
+    fixed on the envelope path. Turning the box to match the source
+    keeps the output inside the budget either way, because both
+    orientations bound the same 2 073 600 pixels.
+    """
+    if width and height and height > width:
+        return (_LOW_RAM_BOX[1], _LOW_RAM_BOX[0])
+    return _LOW_RAM_BOX
+
+
+def _is_taller_than_16_9(width: int | None, height: int | None) -> bool:
+    """``True`` when a 1920x1080 box would shrink more than a 1920x1920
+    one — i.e. the source is taller than 16:9.
+
+    The two boxes agree for 16:9 and for anything wider (a 3840x2160
+    source lands on 1920x1080 either way, an ultrawide is bound by
+    width), and diverge only as the frame gets taller. Compared as a
+    cross-product to avoid dividing by an unmeasured axis.
+    """
+    if not width or not height or width <= 0 or height <= 0:
+        return False
+    return height * 1920 > width * 1080
+
+
+def _needs_8bit_recipe(
+    supported: frozenset[str],
+    metadata: dict[str, Any],
+    low_ram: bool,
+    width: int | None,
+    height: int | None,
+    device_key: str,
+) -> bool:
+    """Whether the recipe must pin ``-pix_fmt yuv420p``.
+
+    Two conditions, and the second is easy to forget: the *source*
+    must be outside 8-bit 4:2:0, and the codec we are about to
+    recommend must actually be subject to that limit. Pinning it for
+    an HEVC target would strip bit depth the board can decode.
+    """
+    if not playback_envelope.is_unsupported_pix_fmt(
+        metadata.get('video_pix_fmt')
+    ):
+        return False
+    target, _box = _recipe_plan(supported, low_ram, width, height, device_key)
+    if target is None:
+        return False
+    return playback_envelope.requires_8bit_420(target, device_key)
+
+
+def _recipe_plan(
+    supported: frozenset[str],
+    low_ram: bool,
+    width: int | None,
+    height: int | None,
+    device_key: str,
+    rotation: int | None = None,
+) -> tuple[str | None, tuple[int, int] | None]:
+    """Choose the codec and the box together, as one decision.
+
+    These were two functions and they disagreed three separate times,
+    which is why this returns both. The box depends on the codec
+    (H.264 is bounded at 1920 on a VideoCore board, HEVC is not) and
+    the codec depends on the box (once a source is being downscaled
+    anyway, the bound stops mattering). Deriving either without the
+    other produced "downscale a 4K master on a board whose HEVC block
+    plays it", and, in the low-RAM case, its mirror image.
+
+    Order matters:
+
+    * **Low-RAM first.** That cap is about memory, not codecs, and
+      applies whatever we recommend. Everything fits inside 1920x1080
+      afterwards, so prefer H.264 — libx264 is several times faster
+      than libx265 and the operator runs this by hand.
+    * **Otherwise prefer a codec needing no box at all**, so the frame
+      survives. On a Pi 4 that turns "throw away three quarters of
+      your 4K master" into "re-encode to HEVC", which the board
+      hardware-decodes and the gate already accepts.
+    * **Only when every candidate is bounded** must the frame give,
+      and then it gives to the preferred codec's bound.
+    """
+    candidates = [c for c in ('h264', 'hevc') if c in supported]
+    if not candidates:
+        return None, None
+    if low_ram:
+        # Orientation is a display question; the budget is not.
+        return candidates[0], _low_ram_box(
+            *_display_dimensions(width, height, rotation)
+        )
+    for codec in candidates:
+        # Coded dimensions on purpose: this asks what the *decoder*
+        # will accept, and the decoder never sees the rotation.
+        #
+        # Both limits, because they live in different modules and
+        # neither implies the other: the envelope holds what the
+        # VideoCore decoder refuses outright, and the ceiling holds
+        # what a software decoder cannot keep up with. Asking only the
+        # envelope told a Pi 5 operator to re-encode 4K to H.264 at
+        # the same size, which the throughput ceiling then refused.
+        if not playback_envelope.frame_exceeds_envelope(
+            codec, width, height, device_key
+        ) and not _exceeds_sw_decode_cap(width, height, device_key, codec):
+            return codec, None
+    target = candidates[0]
+    # Displayed dimensions on purpose: this is the box handed to
+    # ffmpeg's ``scale``, which runs after the rotation matrix has
+    # been applied, and to the HandBrake step the operator types in.
+    display = _display_dimensions(width, height, rotation)
+    # The decoder's own box where it has one. Otherwise the frame is
+    # over a pixel budget rather than outside a decoder's envelope,
+    # and the 1080p box clears every budget this file holds.
+    return target, playback_envelope.encode_box_for(
+        target, *display, device_key
+    ) or _low_ram_box(*display)
+
+
+def _remedy_sentence(
+    codec: str | None,
+    scale_box: tuple[int, int] | None,
+    source_codec: str,
+) -> str:
+    """The fix, phrased to match the command we are about to print.
+
+    The envelope's own remedy has to stay generic because it is also
+    read from the asset list, where no recipe exists. Here we know the
+    plan, so we can say the true thing: on a Pi 4 a 4K master keeps
+    its frame and changes codec, on a Pi 3 it shrinks. Saying "make it
+    1080p" beside a command that preserves 4K is how this pair has
+    already contradicted itself three times.
+    """
+    if codec is None:
+        return 'Convert it with the command below.'
+    name = {'h264': 'H.264', 'hevc': 'HEVC'}.get(codec, codec)
+    changes_codec = codec != source_codec.strip().lower()
+    if scale_box is None:
+        if changes_codec:
+            return (
+                f'Convert it to {name}, which this screen plays at '
+                'its current size.'
+            )
+        return 'Convert it with the command below.'
+    box_w, box_h = scale_box
+    # Name the box, both numbers, rather than its larger side. Once
+    # the box stopped being square, "neither side larger than 1920"
+    # became two different kinds of wrong at once: against a 1920x1200
+    # source it describes something already true and tells the
+    # operator nothing, and against the portrait box it is advice that
+    # permits 1920x1920 — a frame the decoder refuses. The command
+    # below scales into exactly this box, and so does the HandBrake
+    # step, so the sentence should say the same thing they do.
+    resize = f'Resize it to fit inside {box_w} by {box_h} pixels.'
+    if changes_codec:
+        return f'{resize} The command below also converts it to {name}.'
+    return resize
+
+
+def _handbrake_dimensions_step(
+    scale_box: tuple[int, int] | None,
+    width: int | None,
+    height: int | None,
+    rotation: int | None = None,
+) -> str | None:
+    """The Dimensions instruction HandBrake needs, or ``None``.
+
+    ``Fast 1080p30`` always fits the output inside 1920x1080. That is
+    the right answer only when it happens to match the box the ffmpeg
+    recipe was given, so this compares the two and speaks up when they
+    diverge. Two ways they can:
+
+    * **We chose no box at all** — the board is one this module does
+      not characterise, so the recipe preserves the frame. The preset
+      would quietly quarter a 4K source anyway, on the authority of a
+      Raspberry Pi limit that does not apply. Tell HandBrake to stop
+      capping.
+    * **We chose a different box** — the decode envelope bounds each
+      axis at 1920, so a portrait clip is legal at 1080x1920 while the
+      preset would squeeze it to 608x1080.
+
+    Deriving both remedies from one box is the point. They have
+    already disagreed twice, each time because one side was taught a
+    rule the other was not.
+    """
+    width, height = _display_dimensions(width, height, rotation)
+    exceeds_preset = _exceeds_box(width, height, _LOW_RAM_BOX)
+    if scale_box is None:
+        if not exceeds_preset:
+            return None
+        return (
+            'Open the "Dimensions" tab and set "Resolution Limit" to '
+            '"None". This screen can take your video at its current '
+            'size, and the preset would otherwise shrink it for no '
+            'reason.'
+        )
+    if scale_box == _LOW_RAM_BOX or not _is_taller_than_16_9(width, height):
+        return None
+    limit_w, limit_h = scale_box
+    return (
+        'Open the "Dimensions" tab and set "Resolution Limit" to '
+        f'"Custom", then enter {limit_w} for Width and {limit_h} for '
+        'Height. Your video is taller than a standard widescreen '
+        'frame, and the preset on its own would squash it and throw '
+        'away most of the picture.'
+    )
+
+
+def _exceeds_box(
+    width: int | None, height: int | None, box: tuple[int, int]
+) -> bool:
+    """``True`` when fitting inside ``box`` would actually shrink."""
+    if not width or not height or width <= 0 or height <= 0:
+        return False
+    return width > box[0] or height > box[1]
 
 
 def _exceeds_low_ram_pixel_cap(width: int | None, height: int | None) -> bool:
@@ -1525,8 +1913,42 @@ def _exceeds_low_ram_pixel_cap(width: int | None, height: int | None) -> bool:
     return width * height > _LOW_RAM_MAX_PIXELS
 
 
+def _exceeds_sw_decode_cap(
+    width: int | None,
+    height: int | None,
+    device_key: str,
+    codec: str | None,
+) -> bool:
+    """Is this frame past the measured software-decode ceiling here?
+
+    Split out of ``_pixel_cap_rejection`` so ``_recipe_plan`` can ask
+    the same question without also triggering the low-RAM branch,
+    which reaches the host agent over Redis and is the recipe caller's
+    own argument anyway.
+
+    Keeping one implementation matters more than the two lines it
+    saves: the gate and the recipe disagreeing about which frames a
+    board accepts is the single failure this feature keeps producing,
+    and a second copy of this condition is how it would happen again.
+    """
+    cap = _SW_DECODE_MAX_PIXELS.get(device_key, {}).get(
+        (codec or '').strip().lower()
+    )
+    return (
+        cap is not None
+        and width is not None
+        and height is not None
+        and width > 0
+        and height > 0
+        and width * height > cap
+    )
+
+
 def _pixel_cap_rejection(
-    width: int | None, height: int | None, device_key: str
+    width: int | None,
+    height: int | None,
+    device_key: str,
+    codec: str | None = None,
 ) -> str | None:
     """Operator-facing reason this resolution can't play here, or ``None``.
 
@@ -1550,15 +1972,7 @@ def _pixel_cap_rejection(
             'on this device. Boards with less than 1.5 GiB of RAM OOM '
             'when decoding above 1920x1080 alongside the web UI.'
         )
-    cap = _SW_DECODE_MAX_PIXELS.get(device_key)
-    if (
-        cap is not None
-        and width is not None
-        and height is not None
-        and width > 0
-        and height > 0
-        and width * height > cap
-    ):
+    if _exceeds_sw_decode_cap(width, height, device_key, codec):
         return (
             f'Video resolution {width}x{height} exceeds the 1080p cap '
             'on this device. This board decodes video in software and '
@@ -1574,12 +1988,12 @@ def _hw_decoded_codecs(device_key: str) -> frozenset[str]:
     exclusively: ``pi5`` and ``rk3566`` accept H.264 on software
     throughput. So this is the *accepted* set, not a set certified to
     decode in hardware, and not one certified to play either: three
-    entries are known not to (x86 HEVC, Rock Pi 4 HEVC, Pi 4 4K
-    H.264), listed as open defects at the map. A software-decoded
+    entries were known not to (x86 HEVC, Rock Pi 4 HEVC, Pi 4 4K
+    H.264), listed at the map; the Pi 4 one is now closed by
+    ``lib/playback_envelope``. A software-decoded
     entry also wants a resolution ceiling, which
     ``_pixel_cap_rejection`` applies from ``_SW_DECODE_MAX_PIXELS`` —
-    for the boards measured so far, which is ``rk3566`` and not yet
-    ``pi5``.
+    for the boards measured so far, which is ``rk3566`` and ``pi5``.
 
     Callers resolve the key with
     ``anthias_common.board.resolve_device_key`` — so a Rock Pi 4 running
@@ -1618,10 +2032,29 @@ def preferred_download_vcodec() -> str:
     return _PREFERRED_DOWNLOAD_VCODEC.get(resolve_device_key(), 'h264')
 
 
+def _shell_path(name: str) -> str:
+    """Shell-quote a filename so ffmpeg reads it as a path.
+
+    ``shlex.quote`` alone is not enough. It leaves a leading ``-``
+    bare, because a dash needs no shell quoting — but ffmpeg then
+    parses the name as an option and refuses the job outright
+    (``Unrecognized option``), so the operator pastes our command and
+    gets an error instead of a file. Django keeps a leading dash
+    through upload sanitisation, so this is reachable from any
+    ``-clip.mp4`` somebody drags in. The ``./`` prefix costs nothing
+    and settles it.
+    """
+    if name.startswith(('/', './')):
+        return shlex.quote(name)
+    return shlex.quote(f'./{name}')
+
+
 def _ffmpeg_reencode_recipe(
     supported: frozenset[str],
     source_filename: str = '',
-    cap_to_1080p: bool = False,
+    scale_box: tuple[int, int] | None = None,
+    force_8bit_420: bool = False,
+    target_codec: str | None = None,
 ) -> str:
     """Return an ``ffmpeg`` command line the operator can run on
     their workstation to transcode an unsupported upload into a
@@ -1641,28 +2074,89 @@ def _ffmpeg_reencode_recipe(
     stem for ``OUTPUT.mp4`` so the operator can copy the recipe
     verbatim into their terminal without hand-editing it.
 
-    ``cap_to_1080p`` injects ``-vf scale=1920:1080:force_original_aspect_ratio=decrease``
-    so the recipe also downscales an over-resolution source onto the
-    1920×1080 envelope. ``force_original_aspect_ratio=decrease``
-    means the output fits *inside* 1920×1080 (no padding, no
-    stretch) — a 4K 16:9 source becomes exactly 1920×1080, a 4K 21:9
-    ultrawide lands at 1920×823, a portrait 1080×1920 lands at
-    608×1080 (height-bound). Set by either resolution ceiling — the
-    low-RAM memory cap or the software-decode throughput cap; omitted
-    when neither applies, so we don't suggest a needless re-encode when
-    an HD codec swap is all that's wanted.
+    ``scale_box`` is a ``(width, height)`` box the source is fitted
+    *inside* — ``force_original_aspect_ratio=decrease``, so no padding
+    and no stretch. Two callers pass two different boxes, and the
+    difference matters:
+
+    * The **low-RAM** gate passes ``_low_ram_box(...)``, which is
+      ``(1920, 1080)`` turned to match the source. Its constraint is a
+      pixel budget rather than an axis bound, and both orientations
+      bound the same 2,073,600 pixels — so a portrait master keeps its
+      shape instead of landing at 608x1080.
+    * The **decode-envelope** gate passes
+      ``playback_envelope.encode_box_for(...)``, which on a VideoCore
+      board is ``(1920, 1080)`` turned to match the *displayed*
+      frame. It looks like the low-RAM box and is arrived at
+      differently: the decoder bounds each axis at 1920 *and* caps the
+      whole frame at 8192 macroblocks, and 1920x1080 is the largest
+      box satisfying both. Orientation is not cosmetic here either —
+      handing a portrait 2160x3840 source the landscape box produces
+      608x1080, two thirds of a frame the decoder would have taken,
+      while the rejection message alongside says to aim for 1080x1920.
+
+    A single box rather than a flag per gate on purpose: two booleans
+    made "which box wins" a question the type could not answer, and
+    the answer only happened to be safe because the low-RAM branch
+    returns before the envelope check runs.
+
+    ``None`` means no box — the codec-only swap, where the frame is
+    already fine and suggesting a resize would be noise.
+
+    ``force_8bit_420`` injects ``-pix_fmt yuv420p``, which the
+    pixel-format rejection needs: libx264 and libx265 both *preserve*
+    the source's bit depth by default, so a recipe handed to an
+    operator with a High 10 source would faithfully produce another
+    High 10 file and fail the same gate a second time. Emitted by
+    every rejection path that can be handed a non-8-bit source, which
+    is all of them — an 8-bit source doesn't need telling.
     """
-    scale_clause = (
-        '-vf scale=1920:1080:force_original_aspect_ratio=decrease '
-        if cap_to_1080p
-        else ''
-    )
-    if 'h264' in supported:
+    # Every recipe ends with an even-dimension scale, box or no box.
+    # ``decrease`` rounds to wherever the aspect ratio lands, and an
+    # odd result is fatal rather than cosmetic: a 2100x1900 source on
+    # the 1920 box computes 1920x1737 and libx264 refuses the job
+    # (``height not divisible by 2``). The uncapped path needs it too
+    # — 4:2:2 and 4:4:4 permit odd dimensions while yuv420p does not,
+    # so the pixel-format rejection can hand back a 1919x1081 source
+    # with ``-pix_fmt yuv420p`` and no box, and libx264 refuses that
+    # just as hard.
+    #
+    # ``trunc(iw/2)*2`` rather than scale's own ``force_divisible_by``
+    # because that option only landed in FFmpeg 4.4 (2021). Operators
+    # re-encode on their own workstation, and Ubuntu 20.04 still ships
+    # 4.2, where the guard against an unrunnable recipe would itself
+    # make the recipe unrunnable (``Option 'force_divisible_by' not
+    # found``). Debian 11's 4.3 does carry a backport of it, so it is
+    # 20.04 rather than Debian that decides this. The trunc form is
+    # as old as the scale filter.
+    #
+    # The filtergraph is double-quoted because ``trunc(iw/2)*2`` is
+    # full of shell metacharacters: unquoted, ``(`` ends the command
+    # with ``Syntax error: "(" unexpected`` the moment the operator
+    # pastes it, and ``*`` would glob. Quoting is the whole reason
+    # this form is safe to hand out.
+    even_clause = 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+    if scale_box is not None:
+        box_w, box_h = scale_box
+        graph = (
+            f'scale={box_w}:{box_h}'
+            f':force_original_aspect_ratio=decrease,{even_clause}'
+        )
+    else:
+        graph = even_clause
+    scale_clause = f'-vf "{graph}" '
+    pix_fmt_clause = '-pix_fmt yuv420p ' if force_8bit_420 else ''
+    # Passed in by the rejection paths so the codec and the box agree;
+    # falling back to the plain preference keeps direct callers working.
+    if target_codec is None:
+        target_codec = 'h264' if 'h264' in supported else 'hevc'
+    if target_codec == 'h264' and 'h264' in supported:
         template = (
             'ffmpeg -i {input} '
             + scale_clause
             + '-c:v libx264 -preset medium -crf 23 '
-            '-c:a aac -b:a 192k -movflags +faststart {output}'
+            + pix_fmt_clause
+            + '-c:a aac -b:a 192k -movflags +faststart {output}'
         )
         target_suffix = 'h264'
     elif 'hevc' in supported:
@@ -1670,7 +2164,8 @@ def _ffmpeg_reencode_recipe(
             'ffmpeg -i {input} '
             + scale_clause
             + '-c:v libx265 -preset medium -crf 28 '
-            '-tag:v hvc1 -c:a aac -b:a 192k -movflags +faststart '
+            + pix_fmt_clause
+            + '-tag:v hvc1 -c:a aac -b:a 192k -movflags +faststart '
             '{output}'
         )
         target_suffix = 'hevc'
@@ -1684,9 +2179,9 @@ def _ffmpeg_reencode_recipe(
         # target-codec suffix (``sample.h264.mp4`` / ``sample.hevc.mp4``)
         # so a recipe whose input shares the output stem doesn't ask
         # the operator to overwrite their source.
-        in_quoted = shlex.quote(source_filename)
+        in_quoted = _shell_path(source_filename)
         stem, _ = path.splitext(source_filename)
-        out_quoted = shlex.quote(f'{stem}.{target_suffix}.mp4')
+        out_quoted = _shell_path(f'{stem}.{target_suffix}.mp4')
     else:
         in_quoted = 'INPUT'
         out_quoted = f'OUTPUT.{target_suffix}.mp4'
@@ -1700,16 +2195,41 @@ def _ffmpeg_reencode_recipe(
 HANDBRAKE_URL = 'https://handbrake.fr/'
 
 
-def _handbrake_steps(supported: frozenset[str]) -> list[str]:
+def _handbrake_steps(
+    supported: frozenset[str],
+    scale_box: tuple[int, int] | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    rotation: int | None = None,
+) -> list[str]:
     """Return a decision-free, point-and-click HandBrake walkthrough —
     for operators who'd rather not paste a command into a terminal.
 
     Built around HandBrake's stock ``Fast 1080p30`` preset (General
     category): one click produces an H.264 MP4 capped at 1920x1080,
     which every board the viewer supports plays and which is the
-    standard envelope for digital signage. That single preset also
-    satisfies the low-RAM 1080p ceiling, so — unlike the ffmpeg recipe
-    — there's no separate downscale step to spell out.
+    standard envelope for digital signage. That preset caps output at
+    1920x1080. Where that is the box we chose it needs no help; where
+    it is not — a portrait low-RAM source boxed at 1080x1920, or a
+    board with no bound at all — it does.
+
+    ``scale_box`` is the box the ffmpeg recipe was given, and when it
+    disagrees with the preset's own 1920x1080 the operator gets a
+    Dimensions step reconciling them. The decode envelope bounds
+    each *axis* at 1920, so a portrait
+    clip is legal at 1080x1920 — but ``Fast 1080p30`` caps height at
+    1080 and would shrink it to 608x1080, discarding two thirds of a
+    frame the decoder would have taken. Pass the same box the ffmpeg
+    recipe was given and the operator gets a Dimensions step carrying
+    its numbers.
+
+    Take the box rather than a boolean deliberately. The two remedies
+    have already disagreed more than once: the ffmpeg side learned not
+    to borrow
+    a Raspberry Pi bound on a board this module does not characterise,
+    while this side went on emitting one, because each derived the
+    answer separately. Sharing the value makes that impossible rather
+    than merely fixed.
 
     The only board-specific tweak is the encoder: an HEVC-only board
     (Pi 5 before the H.264 software-decode fallback was added) can't
@@ -1733,7 +2253,7 @@ def _handbrake_steps(supported: frozenset[str]) -> list[str]:
         return []
     steps = [
         (
-            f'Download and install HandBrake — it is free — from '
+            f'Download and install HandBrake. It is free, from '
             f'{HANDBRAKE_URL} (Windows, macOS, and Linux).'
         ),
         (
@@ -1742,15 +2262,18 @@ def _handbrake_steps(supported: frozenset[str]) -> list[str]:
         ),
         (
             'In the Presets panel on the right, choose "Fast 1080p30" '
-            '(under the "General" group). This makes a 1080p MP4 — the '
-            'format this screen plays.'
+            '(under the "General" group). This makes a 1080p MP4, '
+            'the format this screen plays.'
         ),
     ]
+    dimensions = _handbrake_dimensions_step(scale_box, width, height, rotation)
+    if dimensions is not None:
+        steps.append(dimensions)
     if not prefers_h264:
         # Pi 5 and friends reject H.264; nudge the encoder to HEVC.
         steps.append(
             'Click the "Video" tab and change "Video Encoder" to '
-            '"H.265 (x265)" — this screen needs HEVC rather than the '
+            '"H.265 (x265)". This screen needs HEVC rather than the '
             "preset's default H.264."
         )
     steps.extend(
@@ -1854,6 +2377,7 @@ def _run_video_normalisation(asset: Asset) -> None:
     supported = _hw_decoded_codecs(device_key)
     video_width = summary.get('video_width')
     video_height = summary.get('video_height')
+    video_rotation = summary.get('video_rotation')
     # ``upload_name`` is stashed by the dashboard / API at upload
     # time — the on-disk file gets renamed to ``<uuid>.<ext>`` but
     # the recipe wants a name the operator can paste straight into
@@ -1868,7 +2392,7 @@ def _run_video_normalisation(asset: Asset) -> None:
 
     if src_codec in supported:
         cap_message = _pixel_cap_rejection(
-            video_width, video_height, device_key
+            video_width, video_height, device_key, src_codec
         )
         if cap_message is not None:
             # Codec is fine but the resolution is past what this board
@@ -1880,12 +2404,92 @@ def _run_video_normalisation(asset: Asset) -> None:
             # clear failure and a copy-pasteable fix instead of a
             # device stuck in an OOM cycle or dropping most frames.
             Asset.objects.filter(asset_id=asset_id).update(**update_dict)
-            recipe = _ffmpeg_reencode_recipe(
-                supported, upload_name, cap_to_1080p=True
+            low_codec, low_ram_box = _recipe_plan(
+                supported,
+                True,
+                video_width,
+                video_height,
+                device_key,
+                video_rotation,
             )
-            handbrake = _handbrake_steps(supported)
+            recipe = _ffmpeg_reencode_recipe(
+                supported,
+                upload_name,
+                scale_box=low_ram_box,
+                target_codec=low_codec,
+                force_8bit_420=_needs_8bit_recipe(
+                    supported,
+                    metadata,
+                    True,
+                    video_width,
+                    video_height,
+                    device_key,
+                ),
+            )
+            handbrake = _handbrake_steps(
+                supported,
+                scale_box=low_ram_box,
+                width=video_width,
+                height=video_height,
+                rotation=video_rotation,
+            )
             raise UnsupportedVideoCodecError(
                 cap_message, recipe=recipe, handbrake=handbrake
+            )
+        # The codec is hardware-decoded on this board, but that only
+        # settles the codec. The stream itself still has to fit the
+        # decoder's envelope: bcm2835-codec refuses anything over
+        # 1920 on either axis or outside 8-bit 4:2:0, and a refused
+        # format means a silent fall back to software decode and a
+        # few frames per second on the screen. Only *blocking*
+        # findings reject here — the advisory tier annotates the
+        # asset list instead, and never stops an upload.
+        blocking = playback_envelope.blocking_warning(metadata, device_key)
+        if blocking is not None and settings['allow_unplayable_video']:
+            # Escape hatch. The hardware fact is unchanged and the
+            # finding still rides on the asset — the operator has only
+            # taken back the decision, and with it the job of checking
+            # the screen, which is the one thing this gate was built
+            # because nobody was doing.
+            metadata['playback_override'] = True
+            blocking = None
+        if blocking is not None:
+            Asset.objects.filter(asset_id=asset_id).update(**update_dict)
+            envelope_codec, envelope_box = _recipe_plan(
+                supported,
+                False,
+                video_width,
+                video_height,
+                device_key,
+                video_rotation,
+            )
+            recipe = _ffmpeg_reencode_recipe(
+                supported,
+                upload_name,
+                scale_box=envelope_box,
+                target_codec=envelope_codec,
+                force_8bit_420=_needs_8bit_recipe(
+                    supported,
+                    metadata,
+                    False,
+                    video_width,
+                    video_height,
+                    device_key,
+                ),
+            )
+            raise UnsupportedVideoCodecError(
+                (
+                    f'{blocking.message} '
+                    + _remedy_sentence(envelope_codec, envelope_box, src_codec)
+                ).strip(),
+                recipe=recipe,
+                handbrake=_handbrake_steps(
+                    supported,
+                    scale_box=envelope_box,
+                    width=video_width,
+                    height=video_height,
+                    rotation=video_rotation,
+                ),
             )
         update_dict['is_processing'] = False
         Asset.objects.filter(asset_id=asset_id).update(**update_dict)
@@ -1913,11 +2517,46 @@ def _run_video_normalisation(asset: Asset) -> None:
     # the software-decoded one. A 4K HEVC upload to an RK3566 would
     # otherwise get a 4K H.264 recipe, and the re-upload would come
     # straight back out of the throughput cap above.
-    cap = (
-        _pixel_cap_rejection(video_width, video_height, device_key) is not None
+    #
+    # The swap also has to clear every gate the asset would meet on
+    # re-upload, not just the codec one. A 4K 10-bit source rejected
+    # for its codec, handed a bare libx264 line, re-encodes to 4K
+    # High 10 and is rejected again, on both the frame size and the
+    # pixel format, which is the second-rejection trap the
+    # ``force_8bit_420`` clause exists to close.
+    # Which ceiling applies depends on the codec we are about to
+    # recommend, and the recommendation depends on whether a ceiling
+    # applies. Break the cycle by asking what the plan would say with
+    # no ceiling: that is the codec the operator will actually
+    # produce, so that is the one whose ceiling counts.
+    provisional_codec, _ = _recipe_plan(
+        supported, False, video_width, video_height, device_key, video_rotation
     )
-    recipe = _ffmpeg_reencode_recipe(supported, upload_name, cap_to_1080p=cap)
-    handbrake = _handbrake_steps(supported)
+    cap = (
+        _pixel_cap_rejection(
+            video_width, video_height, device_key, provisional_codec
+        )
+        is not None
+    )
+    target_codec, box = _recipe_plan(
+        supported, cap, video_width, video_height, device_key, video_rotation
+    )
+    recipe = _ffmpeg_reencode_recipe(
+        supported,
+        upload_name,
+        scale_box=box,
+        target_codec=target_codec,
+        force_8bit_420=_needs_8bit_recipe(
+            supported, metadata, cap, video_width, video_height, device_key
+        ),
+    )
+    handbrake = _handbrake_steps(
+        supported,
+        scale_box=box,
+        width=video_width,
+        height=video_height,
+        rotation=video_rotation,
+    )
     if supported:
         supported_str = ', '.join(sorted(supported))
         message = (
